@@ -57,7 +57,7 @@ class ErnieImagePipeline_JiT(ErnieImagePipeline):
         microflow_relax_steps=3,
     ):
         """
-        Configure JiT pipeline parameters for FLUX2-Klein.
+        Configure JiT pipeline parameters for ERNIE IMAGE.
 
         Args:
             preset: Preset configuration ('default_4x', 'default_7x', or None for custom)
