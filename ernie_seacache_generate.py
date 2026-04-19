@@ -1,236 +1,172 @@
 #!/usr/bin/env python3
-from typing import Any, Dict, Optional, Union
+from typing import List, Optional, Union
 import argparse
 import os
 import re
 from datetime import datetime
 
-import numpy as np
 import torch
-from diffusers import DiffusionPipeline
-from diffusers.models import FluxTransformer2DModel
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.utils import (
-    USE_PEFT_BACKEND,
-    is_torch_version,
-    logging,
-    scale_lora_layers,
-    unscale_lora_layers,
+from diffusers import ErnieImagePipeline, PipelineQuantizationConfig, TorchAoConfig
+from diffusers.models.transformers.transformer_ernie_image import (
+    ErnieImageTransformer2DModel,
+    ErnieImageTransformer2DModelOutput,
 )
-from util_seacache import rel_l1, apply_sea_with_scheduler
+from torchao.quantization import Float8WeightOnlyConfig
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+from util_seacache import apply_sea_with_scheduler, rel_l1
 
 
-def seacache_forward(
+def ernie_seacache_forward(
     self,
     hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor = None,
-    pooled_projections: torch.Tensor = None,
-    timestep: torch.LongTensor = None,
-    img_ids: torch.Tensor = None,
-    txt_ids: torch.Tensor = None,
-    guidance: torch.Tensor = None,
-    joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-    controlnet_block_samples=None,
-    controlnet_single_block_samples=None,
+    timestep: torch.Tensor,
+    text_bth: torch.Tensor,
+    text_lens: torch.Tensor,
     return_dict: bool = True,
-    controlnet_blocks_repeat: bool = False,
-) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+) -> Union[torch.FloatTensor, ErnieImageTransformer2DModelOutput]:
     """
-    Drop-in replacement for FluxTransformer2DModel.forward with SeaCache gating.
-    Logic mirrors the denoise_cache gating (accumulated rescaled relative L1).
+    Drop-in replacement for ErnieImageTransformer2DModel.forward with SeaCache gating.
+
+    Gating logic follows the Flux script pattern:
+    - Track accumulated rescaled relative L1 distance over filtered first-layer modulated inputs.
+    - Skip heavy transformer layers when below threshold by reusing the previous residual.
     """
+    device, dtype = hidden_states.device, hidden_states.dtype
+    batch_size, _, height, width = hidden_states.shape
+    patch_size = self.patch_size
+    hp, wp = height // patch_size, width // patch_size
+    num_img_tokens = hp * wp
 
-    if joint_attention_kwargs is not None:
-        joint_attention_kwargs = joint_attention_kwargs.copy()
-        lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-    else:
-        lora_scale = 1.0
+    img_sbh = self.x_embedder(hidden_states).transpose(0, 1).contiguous()
+    if self.text_proj is not None and text_bth.numel() > 0:
+        text_bth = self.text_proj(text_bth)
+    tmax = text_bth.shape[1]
+    text_sbh = text_bth.transpose(0, 1).contiguous()
 
-    if USE_PEFT_BACKEND:
-        scale_lora_layers(self, lora_scale)
-    else:
-        if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-            logger.warning("Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective.")
+    x = torch.cat([img_sbh, text_sbh], dim=0)
+    seq_len = x.shape[0]
 
-    hidden_states = self.x_embedder(hidden_states)
-
-    timestep = timestep.to(hidden_states.dtype) * 1000
-    if guidance is not None:
-        guidance = guidance.to(hidden_states.dtype) * 1000
-    else:
-        guidance = None
-
-    temb = (
-        self.time_text_embed(timestep, pooled_projections)
-        if guidance is None
-        else self.time_text_embed(timestep, guidance, pooled_projections)
+    text_ids = (
+        torch.cat(
+            [
+                torch.arange(tmax, device=device, dtype=torch.float32).view(1, tmax, 1).expand(batch_size, -1, -1),
+                torch.zeros((batch_size, tmax, 2), device=device),
+            ],
+            dim=-1,
+        )
+        if tmax > 0
+        else torch.zeros((batch_size, 0, 3), device=device)
     )
-    encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-    if txt_ids is not None and txt_ids.ndim == 3:
-        logger.warning("`txt_ids` passed as 3D Tensor; dropping batch dim for rotary embedding cache.")
-        txt_ids = txt_ids[0]
-    if img_ids is not None and img_ids.ndim == 3:
-        logger.warning("`img_ids` passed as 3D Tensor; dropping batch dim for rotary embedding cache.")
-        img_ids = img_ids[0]
+    grid_yx = torch.stack(
+        torch.meshgrid(
+            torch.arange(hp, device=device, dtype=torch.float32),
+            torch.arange(wp, device=device, dtype=torch.float32),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 2)
+    image_ids = torch.cat(
+        [
+            text_lens.float().view(batch_size, 1, 1).expand(-1, num_img_tokens, -1),
+            grid_yx.view(1, num_img_tokens, 2).expand(batch_size, -1, -1),
+        ],
+        dim=-1,
+    )
+    rotary_pos_emb = self.pos_embed(torch.cat([image_ids, text_ids], dim=1))
 
-    if txt_ids is not None and img_ids is not None:
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids)
-    else:
-        # Fallback: some pipelines may pass precomputed rotary or leave ids None in edge cases.
-        image_rotary_emb = None
+    valid_text = (
+        torch.arange(tmax, device=device).view(1, tmax) < text_lens.view(batch_size, 1)
+        if tmax > 0
+        else torch.zeros((batch_size, 0), device=device, dtype=torch.bool)
+    )
+    attention_mask = torch.cat([torch.ones((batch_size, num_img_tokens), device=device, dtype=torch.bool), valid_text], dim=1)[
+        :, None, None, :
+    ]
+
+    sample = self.time_proj(timestep)
+    sample = sample.to(dtype=dtype)
+    c = self.time_embedding(sample)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+        t.unsqueeze(0).expand(seq_len, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)
+    ]
 
     # ---- SeaCache gating ----
     should_calc = True
     if getattr(self, "enable_seacache", False):
-        inp = hidden_states
-        temb_ = temb
-        modulated_inp, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.transformer_blocks[0].norm1(inp, emb=temb_)
-        # Track change based on the first block's norm1 modulation
+        # Match the first layer's input modulation to track per-step changes.
+        x_norm = self.layers[0].adaLN_sa_ln(x)
+        x_mod = (x_norm.float() * (1 + scale_msa.float()) + shift_msa.float()).to(x.dtype)
+
+        # Only image tokens are spatially structured; use them for SEA distance.
+        img_mod = x_mod[:num_img_tokens].transpose(0, 1).contiguous()  # [B, N_img, H]
+        img_mod = img_mod.reshape(batch_size, hp, wp, img_mod.shape[-1])
+        img_mod = apply_sea_with_scheduler(
+            img_mod,
+            self.scheduler,
+            getattr(self, "cnt", 0),
+            power_exp=2.0,
+            dims=(-2, -3),
+            norm_mode="mean",
+        )
+        img_mod = img_mod.reshape(batch_size, num_img_tokens, img_mod.shape[-1])
+
         if self.cnt == 0 or self.cnt == self.num_steps - 1 or self.previous_modulated_input is None:
             should_calc = True
             self.accumulated_rel_l1_distance = 0.0
         else:
-            # Apply SEA filtering before computing distance
-            modulated_inp = modulated_inp.reshape(
-                modulated_inp.shape[0],
-                int(img_ids[:, 1].max().item() + 1),
-                int(img_ids[:, 2].max().item() + 1),
-                modulated_inp.shape[-1],
-            )
-            modulated_inp = apply_sea_with_scheduler(
-                modulated_inp,
-                self.scheduler,
-                getattr(self, "cnt", 0),
-                power_exp=2.0,
-                dims=(-2, -3),
-                norm_mode="mean",
-            )
-            modulated_inp = modulated_inp.reshape(modulated_inp.shape[0], -1, modulated_inp.shape[-1])
-            self.accumulated_rel_l1_distance += rel_l1(modulated_inp, self.previous_modulated_input)
-
+            self.accumulated_rel_l1_distance += rel_l1(img_mod, self.previous_modulated_input)
             if self.accumulated_rel_l1_distance < float(self.seacache_thresh):
                 should_calc = False
             else:
                 should_calc = True
                 self.accumulated_rel_l1_distance = 0.0
 
-        self.previous_modulated_input = modulated_inp
+        self.previous_modulated_input = img_mod
         self.cnt += 1
         if self.cnt == self.num_steps:
-            # Reset step counter at the end of a full trajectory
             self.cnt = 0
 
     # ---- Main block compute / skip ----
-    if getattr(self, "enable_seacache", False) and not should_calc and (self.previous_residual is not None):
-        # Reuse residual from the previous timestep
-        hidden_states = hidden_states + self.previous_residual
+    if getattr(self, "enable_seacache", False) and (not should_calc) and (self.previous_residual is not None):
+        x = x + self.previous_residual
     else:
-        ori_hidden_states = hidden_states
-        for index_block, block in enumerate(self.transformer_blocks):
+        ori_x = x
+        temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
+        for layer in self.layers:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                def create_custom_forward(module):
-                    def custom_forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb):
-                        return module(
-                            hidden_states=hidden_states,
-                            encoder_hidden_states=encoder_hidden_states,
-                            temb=temb,
-                            image_rotary_emb=image_rotary_emb,
-                            joint_attention_kwargs=joint_attention_kwargs,
-                        )
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    encoder_hidden_states,
+                x = self._gradient_checkpointing_func(
+                    layer,
+                    x,
+                    rotary_pos_emb,
                     temb,
-                    image_rotary_emb,
-                    **ckpt_kwargs,
+                    attention_mask,
                 )
             else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
-
-            # controlnet residual
-            if controlnet_block_samples is not None:
-                interval_control = int(np.ceil(len(self.transformer_blocks) / len(controlnet_block_samples)))
-                if controlnet_blocks_repeat:
-                    hidden_states = hidden_states + controlnet_block_samples[index_block % len(controlnet_block_samples)]
-                else:
-                    hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
-
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                def create_custom_forward(module):
-                    def custom_forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb):
-                        return module(
-                            hidden_states=hidden_states,
-                            encoder_hidden_states=encoder_hidden_states,
-                            temb=temb,
-                            image_rotary_emb=image_rotary_emb,
-                            joint_attention_kwargs=joint_attention_kwargs,
-                        )
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    **ckpt_kwargs,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
-
-            if controlnet_single_block_samples is not None:
-                interval_control = int(np.ceil(len(self.single_transformer_blocks) / len(controlnet_single_block_samples)))
-                hidden_states = hidden_states + controlnet_single_block_samples[index_block // interval_control]
+                x = layer(x, rotary_pos_emb, temb, attention_mask)
 
         if getattr(self, "enable_seacache", False):
-            # Cache residual from the current step
-            self.previous_residual = hidden_states - ori_hidden_states
+            self.previous_residual = x - ori_x
 
-    hidden_states = self.norm_out(hidden_states, temb)
-    output = self.proj_out(hidden_states)
-
-    if USE_PEFT_BACKEND:
-        unscale_lora_layers(self, lora_scale)
+    x = self.final_norm(x, c).type_as(x)
+    patches = self.final_linear(x)[:num_img_tokens].transpose(0, 1).contiguous()
+    output = (
+        patches.view(batch_size, hp, wp, patch_size, patch_size, self.out_channels)
+        .permute(0, 5, 1, 3, 2, 4)
+        .contiguous()
+        .view(batch_size, self.out_channels, height, width)
+    )
 
     if not return_dict:
         return (output,)
-    return Transformer2DModelOutput(sample=output)
+    return ErnieImageTransformer2DModelOutput(sample=output)
 
 
 # Replace Diffusers model forward
-FluxTransformer2DModel.forward = seacache_forward
+ErnieImageTransformer2DModel.forward = ernie_seacache_forward
 
 
-# ----------------------------
-# Utils
-# ----------------------------
-def read_prompts(path: str):
+def read_prompts(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
@@ -241,109 +177,34 @@ def safe_filename(name: str) -> str:
     return name or "img"
 
 
-def now_str():
+def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Diffusers + SeaCache (FLUX) — image generation from prompts (aligned with the second script)."
+        description="Ernie-Image + SeaCache generation (CPU load + TorchAO FP8 quantization + GPU inference)."
     )
-    # Prompt input options
-    parser.add_argument(
-        "--prompt_file",
-        type=str,
-        default=None,
-        help="Path to a text file containing one prompt per line.",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default="a photo of an astronaut riding a horse",
-        help="Single prompt string. Used if --prompt_file is not provided.",
-    )
+    parser.add_argument("--prompt_file", type=str, default=None, help="Path to text file (one prompt per line).")
+    parser.add_argument("--prompt", type=str, default="A serene mountain lake at sunset, cinematic lighting")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save generated images.")
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--guidance", type=float, default=4.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_images_per_prompt", type=int, default=1)
+    parser.add_argument("--negative_prompt", type=str, default="")
+    parser.add_argument("--model_id", type=str, default="Baidu/ERNIE-Image")
+    parser.add_argument("--seacache_thresh", type=float, default=0.3)
+    parser.add_argument("--use_pe", action="store_true", help="Enable prompt enhancer in Ernie pipeline.")
+    parser.add_argument("--compile_transformer", action="store_true")
+    return parser.parse_args()
 
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Directory to save the generated images.",
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="Image width (multiple of 16, same default as the second script).",
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=1024,
-        help="Image height (multiple of 16, same default as the second script).",
-    )
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=50,
-        help="Number of sampling steps. Defaults: flux-dev=50, flux-schnell=4.",
-    )
-    parser.add_argument(
-        "--guidance",
-        type=float,
-        default=3.5,
-        help="Guidance scale (default 3.5, same as the second script).",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Base random seed (global sample index is added to this).",
-    )
-    parser.add_argument(
-        "--num_images_per_prompt",
-        type=int,
-        default=1,
-        help="Number of images to generate per prompt.",
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="flux-dev",
-        choices=["flux-dev", "flux-schnell"],
-        help="Model name (same choices as the second script).",
-    )
-    parser.add_argument(
-        "--model_id",
-        type=str,
-        default=None,
-        help="Optional explicit HF model id. If set, overrides model_name.",
-    )
-    parser.add_argument(
-        "--offload",
-        action="store_true",
-        help="Use CPU offload (`enable_model_cpu_offload`).",
-    )
 
-    # SeaCache threshold: conceptually equivalent to specache_thresh in the other script
-    parser.add_argument(
-        "--seacache_thresh",
-        type=float,
-        default=0.3,
-        help="SeaCache threshold (equivalent to specache_thresh in the other script). 0.3: 2x, 0.6: 3x",
-    )
+def main() -> None:
+    args = parse_args()
 
-    # dtype selection (matches the second script's default bfloat16)
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bf16",
-        choices=["bf16", "fp16"],
-        help="Computation dtype (default bf16, as in the second script).",
-    )
-
-    args = parser.parse_args()
-
-    # Decide where prompts come from
     if args.prompt_file:
         prompts = read_prompts(args.prompt_file)
         prompt_source = args.prompt_file
@@ -351,117 +212,113 @@ def main():
         prompts = [args.prompt]
         prompt_source = "<inline-prompt>"
     else:
-        parser.error("You must provide either --prompt_file or --prompt.")
+        raise ValueError("Provide --prompt_file or --prompt")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this script.")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ====== Device / dtype configuration ======
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    want_bf16 = args.dtype == "bf16"
-    torch_dtype = torch.bfloat16 if (want_bf16 and device == "cuda") else torch.float16
+    # 1) Load on CPU with TorchAO FP8 quantization mapping (matches main.py intent).
+    pipeline_quant_config = PipelineQuantizationConfig(
+        quant_mapping={"transformer": TorchAoConfig(Float8WeightOnlyConfig())}
+    )
+    pipe = ErnieImagePipeline.from_pretrained(
+        args.model_id,
+        quantization_config=pipeline_quant_config,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
+    )
 
-    # ====== Model mapping (same naming as the second script) ======
-    if args.model_id is not None:
-        model_id = args.model_id
-        model_name = "flux-dev" if "dev" in model_id else "flux-schnell"
-    else:
-        if args.model_name == "flux-dev":
-            model_id = "black-forest-labs/FLUX.1-dev"
-        else:
-            model_id = "black-forest-labs/FLUX.1-schnell"
-        model_name = args.model_name
+    # 2) Move quantized model to GPU for inference.
+    pipe = pipe.to("cuda")
+    # pipe.transformer.to(memory_format=torch.channels_last)
+    # if args.compile_transformer:
+        # pipe.transformer.compile(mode="max-autotune", fullgraph=False)
 
-    # ====== Default steps ======
-    if args.num_inference_steps is None:
-        num_steps = 4 if model_name == "flux-schnell" else 50
-    else:
-        num_steps = args.num_inference_steps
-
-    # ====== Load pipeline ======
-    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-    if args.offload:
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to(device)
-
-    # SeaCache state variables stored on the model instance
     tr = pipe.transformer
     tr.scheduler = pipe.scheduler
     tr.enable_seacache = True
     tr.seacache_thresh = float(args.seacache_thresh)
 
-    # Random sequence: same pattern as the second script (global sample index)
     base_seed = int(args.seed)
-    global_sample_idx = 0  # Index over all generated images
+    global_sample_idx = 0
 
     print(
-        f"[{now_str()}] Start | model_id={model_id} ({model_name}) | steps={num_steps} | "
+        f"[{now_str()}] Start | model_id={args.model_id} | steps={args.num_inference_steps} | "
         f"guidance={args.guidance} | seacache_thresh={args.seacache_thresh} | "
-        f"prompts={len(prompts)} | seed={base_seed} | dtype={torch_dtype}"
+        f"prompts={len(prompts)} | seed={base_seed} | quant=torchao-fp8"
     )
 
+    height = (args.height // 16) * 16
+    width = (args.width // 16) * 16
+
     for p_idx, prompt in enumerate(prompts):
-        n = int(args.num_images_per_prompt)
-        for i in range(n):
-            # Per-sample seed
+        for i in range(int(args.num_images_per_prompt)):
             seed_this = base_seed + global_sample_idx
 
-            # Reset SeaCache state 
             tr.cnt = 0
-            tr.num_steps = int(num_steps)
+            tr.num_steps = int(args.num_inference_steps)
             tr.accumulated_rel_l1_distance = 0.0
             tr.previous_modulated_input = None
             tr.previous_residual = None
 
-            generator = torch.Generator(device=device).manual_seed(seed_this)
-
-            out = pipe(
+            generator = torch.Generator(device="cuda").manual_seed(42)
+            _ = pipe(
                 prompt=prompt,
-                num_inference_steps=num_steps,
-                height=(args.height // 16) * 16,
-                width=(args.width // 16) * 16,
-                guidance_scale=gscale
-                if (gscale := (0.0 if model_name == "flux-schnell" else float(args.guidance)))
-                is not None
-                else 0.0,
-                max_sequence_length=256 if model_name == "flux-schnell" else 512,
+                negative_prompt=args.negative_prompt,
+                height=height,
+                width=width,
+                num_inference_steps=int(args.num_inference_steps),
+                guidance_scale=float(args.guidance),
                 num_images_per_prompt=1,
+                use_pe=bool(args.use_pe),
                 generator=generator,
             )
-
-            # Save image
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            out = pipe(
+                prompt=prompt,
+                negative_prompt=args.negative_prompt,
+                height=height,
+                width=width,
+                num_inference_steps=int(args.num_inference_steps),
+                guidance_scale=float(args.guidance),
+                num_images_per_prompt=1,
+                use_pe=bool(args.use_pe),
+                generator=generator,
+            )
+            end.record()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print(f"Inference time: {start.elapsed_time(end)} ms")
+            # image.save(f"output_fp8_{Prompt}.png")
             img = out.images[0]
             base = safe_filename(prompt)[:80]
-            fn = f"SeaCache_{global_sample_idx:05d}-{base}.png"
+            fn = f"ErnieSeaCache_{global_sample_idx:05d}-{base}.png"
             img.save(os.path.join(args.output_dir, fn))
 
-            truncated_prompt = prompt[:60] + ("…" if len(prompt) > 60 else "")
-            print(
-                f"  - [{p_idx + 1}/{len(prompts)}] '{truncated_prompt}' "
-                f"# {i + 1}/{n} => 1 image"
-            )
-
+            print(f"  - [{p_idx + 1}/{len(prompts)}] #{i + 1}/{args.num_images_per_prompt} saved {fn}")
             global_sample_idx += 1
-        break  # NOTE: kept from your original script (only first prompt is processed).
 
-    # Summary (no timing)
-    if global_sample_idx > 0:
-        total_images = global_sample_idx
-        summary_lines = [
-            "",
-            "[Generation Summary]",
-            f"  Output dir:                 {args.output_dir}",
-            f"  Model id:                   {model_id}",
-            f"  Model name:                 {model_name}",
-            f"  Steps per image:            {num_steps}",
-            f"  Guidance:                   {args.guidance}",
-            f"  SeaCache threshold:         {args.seacache_thresh}",
-            f"  Prompt source:              {prompt_source}",
-            f"  Seed (base):                {base_seed}",
-            f"  Total images:               {total_images}",
-            f"  Size (WxH):                 {args.width}x{args.height}",
-        ]
-        print("\n".join(summary_lines))
+    print(
+        "\n".join(
+            [
+                "",
+                "[Generation Summary]",
+                f"  Output dir:                 {args.output_dir}",
+                f"  Model id:                   {args.model_id}",
+                f"  Steps per image:            {args.num_inference_steps}",
+                f"  Guidance:                   {args.guidance}",
+                f"  SeaCache threshold:         {args.seacache_thresh}",
+                f"  Prompt source:              {prompt_source}",
+                f"  Seed (base):                {base_seed}",
+                f"  Total images:               {global_sample_idx}",
+                f"  Size (WxH):                 {width}x{height}",
+            ]
+        )
+    )
 
 
 if __name__ == "__main__":
